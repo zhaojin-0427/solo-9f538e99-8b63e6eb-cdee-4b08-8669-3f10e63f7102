@@ -4,6 +4,8 @@ import sqlite3
 
 from flask import current_app, g
 
+from . import stats
+
 
 def get_db():
     if "db" not in g:
@@ -32,6 +34,8 @@ def init_db(conn, schema_path=None):
     # WAL：允许服务进程写库的同时其他连接读库（例如自查脚本）
     conn.execute("PRAGMA journal_mode = WAL")
     conn.commit()
+    # 升级旧 SQLite 卷：新表已建，按历史流水一次性补齐层级统计
+    stats.ensure_backfilled(conn)
 
 
 def init_app(app):

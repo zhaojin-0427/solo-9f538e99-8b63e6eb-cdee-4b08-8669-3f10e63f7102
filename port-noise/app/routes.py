@@ -4,6 +4,7 @@ import json
 from flask import (
     Blueprint,
     abort,
+    g,
     jsonify,
     redirect,
     render_template,
@@ -11,7 +12,7 @@ from flask import (
     url_for,
 )
 
-from . import ingest, solver
+from . import ingest, solver, stats
 from .db import get_db, is_seed_loaded
 
 bp = Blueprint("main", __name__)
@@ -30,6 +31,18 @@ def conflict(exc):
     if request.path.startswith("/api/"):
         return jsonify(error=exc.description), 409
     return f"<h1>409</h1><p>{exc.description}</p>", 409
+
+
+@bp.app_errorhandler(500)
+def internal_error(exc):
+    # 任何写库中途失败：显式回滚，保证钟差、单据、统计都照旧
+    conn = g.pop("db", None)
+    if conn is not None:
+        conn.rollback()
+        conn.close()
+    if request.path.startswith("/api/"):
+        return jsonify(error="服务器内部错误，本笔业务已回滚，库内数据保持原样"), 500
+    return "<h1>500</h1><p>服务器内部错误，本笔业务已回滚，库内数据保持原样。</p>", 500
 
 
 # --------------------------------------------------------------------------
@@ -160,6 +173,47 @@ def events_page():
     return render_template("events.html", events=parsed)
 
 
+@bp.route("/handover")
+def handover_page():
+    """班组交接：区间内同时有效复核单峰值与首次超限流水。"""
+    conn = get_db()
+    if not is_seed_loaded(conn):
+        return redirect(url_for("main.upload_page"))
+    cranes = solver.list_cranes(conn)
+    max_serial = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+
+    form = {"crane_id": request.args.get("crane_id", ""),
+            "start_serial": request.args.get("start_serial", ""),
+            "end_serial": request.args.get("end_serial", ""),
+            "limit": request.args.get("limit", "")}
+    error, report = None, None
+    if any(form.values()):
+        try:
+            crane_id = form["crane_id"].strip()
+            start_serial = int(form["start_serial"])
+            end_serial = int(form["end_serial"])
+            limit = int(form["limit"])
+        except (TypeError, ValueError):
+            error = "起止流水号与上限都必须是整数。"
+        else:
+            if crane_id not in cranes:
+                error = f"吊机班组 {crane_id} 不存在。"
+            elif limit < 0:
+                error = "上限必须是非负整数。"
+            elif start_serial < 1 or end_serial < 1:
+                error = "流水号必须是正整数。"
+            elif end_serial < start_serial:
+                error = "止号不能小于起号。"
+            elif end_serial > max_serial:
+                error = f"止号超出当前最大流水号 {max_serial}。"
+            else:
+                report = stats.handover_report(
+                    conn, crane_id, start_serial, end_serial, limit)
+                report["exceeded"] = report["first_exceed_serial"] is not None
+    return render_template("handover.html", cranes=cranes, max_serial=max_serial,
+                           form=form, error=error, report=report)
+
+
 # --------------------------------------------------------------------------
 # JSON API
 # --------------------------------------------------------------------------
@@ -233,6 +287,8 @@ def api_issue_form():
         "INSERT INTO forms(form_no, peak_id, crane_id, status, created_event) "
         "VALUES (?, ?, ?, 'active', ?)",
         (form_no, peak_id, determination["crane"], event_id))
+    # 统计与签发同事务入库：保存失败则事件、单据、统计一并回滚
+    stats.apply_delta(conn, determination["crane"], event_id, +1)
     conn.commit()
     return jsonify(form_no=form_no, peak_id=peak_id,
                    crane_id=determination["crane"], event_id=event_id), 201
@@ -248,6 +304,41 @@ def api_form_status(form_no):
     if form is None:
         return jsonify(error=f"复核单 {form_no} 不存在"), 404
     return jsonify(dict(form))
+
+
+@bp.get("/api/handover")
+def api_handover():
+    """班组交接核算：?crane_id=&start_serial=&end_serial=&limit=。
+
+    只读取已入库的层级汇总，返回区间内同时有效单数峰值、首次超限流水号
+    以及本次核算实际读取的汇总行数（read_rows，硬上限 64）。
+    """
+    conn = get_db()
+    _require_loaded(conn)
+    try:
+        crane_id = request.args["crane_id"].strip()
+        start_serial = int(request.args["start_serial"])
+        end_serial = int(request.args["end_serial"])
+        limit = int(request.args["limit"])
+    except (KeyError, TypeError, ValueError):
+        return jsonify(error="需要整数参数 crane_id, start_serial, end_serial, limit"), 400
+    if limit < 0:
+        return jsonify(error="上限 limit 必须是非负整数"), 400
+    if start_serial < 1 or end_serial < 1:
+        return jsonify(error="流水号必须是正整数"), 400
+    if end_serial < start_serial:
+        return jsonify(error="end_serial 不能小于 start_serial"), 400
+    if crane_id not in solver.list_cranes(conn):
+        return jsonify(error=f"吊机班组 {crane_id} 不存在"), 404
+    max_serial = conn.execute("SELECT COALESCE(MAX(id), 0) FROM events").fetchone()[0]
+    if end_serial > max_serial:
+        return jsonify(error=f"end_serial 超出当前最大流水号 {max_serial}"), 400
+
+    report = stats.handover_report(
+        conn, crane_id, start_serial, end_serial, limit)
+    report["exceeded"] = report["first_exceed_serial"] is not None
+    report["max_query_reads"] = stats.MAX_QUERY_READS
+    return jsonify(report)
 
 
 @bp.get("/api/clock-records")
@@ -317,6 +408,7 @@ def api_correct_clock(rec_id):
     bounds, conflict2 = solver.current_bounds(conn)
     # 已做过负环试解，这里仅可能因连通性变化产生 None，按失归属处理
     revoked = []
+    revoked_per_crane = {}
     active_forms = conn.execute(
         "SELECT * FROM forms WHERE status = 'active' ORDER BY created_event"
     ).fetchall()
@@ -346,6 +438,13 @@ def api_correct_clock(rec_id):
             revoked.append({"form_no": form["form_no"],
                             "peak_id": form["peak_id"],
                             "event_id": revoke_event})
+            # 同次钟差更正撤回的单从更正号起一并扣除；随后的撤单流水沿用更正后的单数
+            revoked_per_crane[form["crane_id"]] = \
+                revoked_per_crane.get(form["crane_id"], 0) + 1
+
+    # 统计与钟差更正、撤单同事务入库：任一保存失败则钟差、单据、统计都照旧
+    for crane_id, amount in revoked_per_crane.items():
+        stats.apply_delta(conn, crane_id, correction_event, -amount)
 
     conn.commit()
     return jsonify(

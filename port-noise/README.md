@@ -95,13 +95,39 @@ pip install -r requirements.txt
 flask --app app run --port 8000        # 库默认在 ./data/port_noise.sqlite3
 ```
 
+## 班组交接：在用复核单超限核算
+
+班组交接时要回答：某吊机班组在一段流水区间内，**同时有效的复核单最多有多少、
+首次超过约定数量的是哪条流水**。“班组交接”页选吊机班组、填起止流水号（含首尾）
+和非负整数上限即可核算；始终未超限会明确标注。
+
+### 计数口径（按每笔业务入库后的状态）
+
+* 流水号就是 `events.id`，入库先后即流水先后。
+* 签发（issue）：对应吊机在用单数 `+1`。
+* 钟差更正（correction）：同次更正撤回的单**从更正号起一并扣除**（按吊机把撤单数
+  作为负增量计入更正号）；同批随后的撤销事件不再重复扣，沿用更正后的单数。
+* 起号之前发出且仍有效的单计入起号基线；若起号本身已超限，直接报起号。
+* 签发/更正与统计写在**同一事务**：任一保存失败，钟差、单据、统计全部回滚照旧。
+
+### 层级化汇总：百万流水、每次最多读 64 条
+
+`crane_count_stats` 是 8 叉块层级（B=8）：叶子块存块内 8 条流水的增量，上层块存
+8 个子块的块内最高/块末**绝对单数**。任意区间核算只读 O(log₈ N) 行已入库汇总，
+绝不逐条扫描 events/forms，硬上限 64 行（`stats.MAX_QUERY_READS`，超限直接抛错自检）。
+响应与页面都返回本次实际读取条数 `read_rows`。
+
+升级旧 SQLite 卷时，应用启动（`db.init_db`）自动检测 `app_meta` 标记并按历史
+events/forms 一次性回填层级统计（`stats.ensure_backfilled`），回填幂等、单事务。
+
 ## 使用流程
 
 1. 打开“数据导入”，一次上传三份 CSV（整季只允许导入一次，重复导入拒绝；校验失败整笔回滚）。
 2. “峰查询”输入峰号查看每台吊机的可行偏移窗口与作业判定；可签峰一键签发。
 3. “钟差记录/更正”逐条改 `[low, high]`；无解时页面/API 给出冲突记录，数据不动。
 4. 更正生效后响应与“复核单”页列出撤销单号；按单号可随时查状态与撤销原因。
-5. “事件流水”按序号回看上传/签发/更正/撤销的交错过程。
+5. “班组交接”选吊机、填起止流水号与上限，看同时有效单数峰值、首次超限流水与读取条数。
+6. “事件流水”按序号回看上传/签发/更正/撤销的交错过程。
 
 ## HTTP API 摘要
 
@@ -113,6 +139,7 @@ flask --app app run --port 8000        # 库默认在 ./data/port_noise.sqlite3
 | GET | `/api/forms/<form_no>` | 单号查状态 |
 | GET | `/api/clock-records` | 钟差记录全量（含失效历史行） |
 | POST | `/api/clock-records/<rec_id>/correct` | body `{"low_sec": n, "high_sec": m}`；无解返回 409 + `conflict_records` |
+| GET | `/api/handover` | query `crane_id,start_serial,end_serial,limit`；返回区间同时有效单数峰值 `max_count`、首次超限流水 `first_exceed_serial`（未超限为 `null`）、本次读取条数 `read_rows`（≤64） |
 
 ## 测试与演示
 
@@ -120,5 +147,6 @@ flask --app app run --port 8000        # 库默认在 ./data/port_noise.sqlite3
 pip install pytest flask
 pytest -q
 python scripts/demo.py
-python scripts/generate_bulk.py --out /tmp/bulk   # 生成 6 万区间压测数据
+python scripts/generate_bulk.py --out /tmp/bulk        # 生成 6 万区间压测数据
+python scripts/load_handover.py --serials 1000000      # 百万流水交接核算压测
 ```

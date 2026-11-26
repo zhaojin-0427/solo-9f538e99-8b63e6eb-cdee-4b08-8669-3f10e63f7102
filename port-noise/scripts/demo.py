@@ -95,6 +95,18 @@ def main():
     show("旧单仍为 revoked", client.get(f"/api/forms/{form_no}"))
     reissued = client.post("/api/forms", json={"peak_id": "P1"})
     show("重新签发（新单号）", reissued)
+
+    # 班组交接：再签一张 P7，使 C1 同时有两张有效单，然后核算超限
+    p7 = client.post("/api/forms", json={"peak_id": "P7"})
+    show("P7 再签一张 C1 复核单", p7)
+    max_event = reissued.get_json()["event_id"]
+    show("班组交接核算（上限 1，应在第二张单流水首次超限，且只读取少量汇总行）",
+         client.get(f"/api/handover?crane_id=C1&start_serial=1"
+                    f"&end_serial={max_event + 1}&limit=1"))
+    show("班组交接核算（上限 99，应标注始终未超限）",
+         client.get(f"/api/handover?crane_id=C1&start_serial=1"
+                    f"&end_serial={max_event + 1}&limit=99"))
+
     show("钟差记录历史（含失效行）", client.get("/api/clock-records"))
     print("\n演示完成。数据库文件：", app.config["DATABASE"])
 

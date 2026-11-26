@@ -61,3 +61,33 @@ CREATE TABLE IF NOT EXISTS forms (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_form_active_per_peak
     ON forms(peak_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_form_status ON forms(status);
+
+-- --------------------------------------------------------------------------
+-- 班组交接统计：按事件流水（events.id 即流水号）记录每台吊机在用复核单数
+--
+-- 层级化块汇总，块大小为 8。level=0 的叶子块覆盖 8 条流水，level=l 的块覆盖
+-- 8^(l+1) 条；block_idx 为块在该层内的序号（从 0 开始）。
+--   base_end_count：块起点前（不含本块）该吊机的有效单数
+--   child_max      ：8 个子块各自“块内最高有效单数”（JSON 数组，稀疏可含 null）
+--   child_end      ：8 个子块各自“块末有效单数”（同上）
+--   leaf_deltas    ：仅叶子块，块内 8 条流水各自造成的单数增减（JSON 数组）
+--
+-- 任意区间核算只读 O(log8 N) 行汇总（百万流水下不超过几十行，硬上限 64 行），
+-- 绝不逐条扫描 events/forms。
+-- --------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS crane_count_stats (
+    crane_id       TEXT NOT NULL,
+    level          INTEGER NOT NULL,
+    block_idx      INTEGER NOT NULL,
+    base_end_count INTEGER NOT NULL,
+    child_max      TEXT NOT NULL DEFAULT '[]',
+    child_end      TEXT NOT NULL DEFAULT '[]',
+    leaf_deltas    TEXT NOT NULL DEFAULT '[]',
+    PRIMARY KEY (crane_id, level, block_idx)
+) WITHOUT ROWID;
+
+-- 应用级元数据：记录统计汇总是否已对旧卷历史流水补齐（backfill）
+CREATE TABLE IF NOT EXISTS app_meta (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

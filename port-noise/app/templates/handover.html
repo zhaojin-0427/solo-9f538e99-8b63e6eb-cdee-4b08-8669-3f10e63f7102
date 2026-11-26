@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}班组交接 · 噪声峰复核{% endblock %}
+{% block content %}
+<h2>班组交接：在用复核单超限核算</h2>
+<p>
+  选吊机班组，填写起止流水号（<strong>含首尾</strong>）和非负整数上限。
+  系统按每笔业务<strong>入库后的状态</strong>计数，给出区间内同时有效的复核单最多有多少、
+  首次超过上限的是哪条流水；起号前发出且仍有效的单也计入，若起号已超限则直接报起号。
+  同次钟差更正撤回的单从更正号起一并扣除。核算只用已入库的层级汇总，每次最多读
+  {{ 64 }} 条。
+</p>
+
+<form method="get" class="card">
+  <label>吊机班组
+    <select name="crane_id" required>
+      <option value="">请选择</option>
+      {% for c in cranes %}
+      <option value="{{ c }}" {% if form.crane_id == c %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>起始流水号（含）
+    <input type="number" name="start_serial" min="1" max="{{ max_serial }}"
+           value="{{ form.start_serial }}" required>
+  </label>
+  <label>截止流水号（含）
+    <input type="number" name="end_serial" min="1" max="{{ max_serial }}"
+           value="{{ form.end_serial }}" required>
+  </label>
+  <label>约定数量上限（非负整数）
+    <input type="number" name="limit" min="0" value="{{ form.limit }}" required>
+  </label>
+  <button type="submit">核算</button>
+  <small>当前最大流水号：{{ max_serial }}</small>
+</form>
+
+{% if error %}
+  <p class="error">{{ error }}</p>
+{% endif %}
+
+{% if report %}
+<div class="card">
+  <h3>核算结果 · 班组 {{ report.crane_id }}</h3>
+  <table class="kv">
+    <tr><th>流水区间</th><td>{{ report.start_serial }} ～ {{ report.end_serial }}（含首尾）</td></tr>
+    <tr><th>约定上限</th><td>{{ report.limit }}</td></tr>
+    <tr><th>区间内同时有效单数最多</th><td><strong>{{ report.max_count }}</strong> 单</td></tr>
+    <tr>
+      <th>首次超限流水号</th>
+      <td>
+        {% if report.exceeded %}
+          <span class="tag warn">第 {{ report.first_exceed_serial }} 号流水后首次超过上限</span>
+        {% else %}
+          <span class="tag ok">区间内始终未超限</span>
+        {% endif %}
+      </td>
+    </tr>
+    <tr>
+      <th>本次核算读取汇总条数</th>
+      <td><strong>{{ report.read_rows }}</strong> 条（硬上限 64 条）</td>
+    </tr>
+  </table>
+  <p class="warn">
+    计数口径：每笔业务入库后的有效单数；起号前仍有效的单计入起号基线；
+    钟差更正的撤单量并入更正号扣除，同批撤单流水沿用更正后的单数。
+  </p>
+</div>
+{% endif %}
+{% endblock %}
